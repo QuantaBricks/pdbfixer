@@ -1,0 +1,321 @@
+{
+  "class": "PDBFixer",
+  "import": "from pdbfixer import PDBFixer",
+  "constructor": {
+    "signature": "PDBFixer(filename=None, pdbfile=None, pdbxfile=None, url=None, pdbid=None, platform=None)",
+    "note": "Provide exactly one of filename/pdbfile/pdbxfile/url/pdbid. filename/url auto-detect PDB vs PDBx/mmCIF.",
+    "params": [
+      {
+        "name": "filename",
+        "required": false,
+        "default": null
+      },
+      {
+        "name": "pdbfile",
+        "required": false,
+        "default": null
+      },
+      {
+        "name": "pdbxfile",
+        "required": false,
+        "default": null
+      },
+      {
+        "name": "url",
+        "required": false,
+        "default": null
+      },
+      {
+        "name": "pdbid",
+        "required": false,
+        "default": null
+      },
+      {
+        "name": "platform",
+        "required": false,
+        "default": null
+      }
+    ]
+  },
+  "methods": [
+    {
+      "name": "addHydrogensToLigands",
+      "signature": "addHydrogensToLigands(templates, residueNames=None)",
+      "params": [
+        {
+          "name": "templates",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "residueNames",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Add hydrogen atoms to ligand/heterogen residues using RDKit."
+    },
+    {
+      "name": "addMembrane",
+      "signature": "addMembrane(lipidType='POPC', membraneCenterZ=0 nm, minimumPadding=1 nm, positiveIon='Na+', negativeIon='Cl-', ionicStrength=0 M)",
+      "params": [
+        {
+          "name": "lipidType",
+          "required": false,
+          "default": "POPC"
+        },
+        {
+          "name": "membraneCenterZ",
+          "required": false,
+          "default": "0 nm"
+        },
+        {
+          "name": "minimumPadding",
+          "required": false,
+          "default": "1 nm"
+        },
+        {
+          "name": "positiveIon",
+          "required": false,
+          "default": "Na+"
+        },
+        {
+          "name": "negativeIon",
+          "required": false,
+          "default": "Cl-"
+        },
+        {
+          "name": "ionicStrength",
+          "required": false,
+          "default": "0 M"
+        }
+      ],
+      "doc": "Add a lipid membrane to the structure."
+    },
+    {
+      "name": "addMissingAtoms",
+      "signature": "addMissingAtoms(seed=None)",
+      "params": [
+        {
+          "name": "seed",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Add all missing heavy atoms, as specified by the missingAtoms, missingTerminals, and missingResidues fields."
+    },
+    {
+      "name": "addMissingHydrogens",
+      "signature": "addMissingHydrogens(pH=7.0, forcefield=None)",
+      "params": [
+        {
+          "name": "pH",
+          "required": false,
+          "default": 7.0
+        },
+        {
+          "name": "forcefield",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Add missing hydrogen atoms to the structure."
+    },
+    {
+      "name": "addSolvent",
+      "signature": "addSolvent(boxSize=None, padding=None, boxVectors=None, positiveIon='Na+', negativeIon='Cl-', ionicStrength=0 M, boxShape='cube', forceField=None)",
+      "params": [
+        {
+          "name": "boxSize",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "padding",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "boxVectors",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "positiveIon",
+          "required": false,
+          "default": "Na+"
+        },
+        {
+          "name": "negativeIon",
+          "required": false,
+          "default": "Cl-"
+        },
+        {
+          "name": "ionicStrength",
+          "required": false,
+          "default": "0 M"
+        },
+        {
+          "name": "boxShape",
+          "required": false,
+          "default": "cube"
+        },
+        {
+          "name": "forceField",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Add a solvent box surrounding the structure."
+    },
+    {
+      "name": "applyMutations",
+      "signature": "applyMutations(mutations, chain_id)",
+      "params": [
+        {
+          "name": "mutations",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "chain_id",
+          "required": true,
+          "default": null
+        }
+      ],
+      "doc": "Apply a list of amino acid substitutions to make a mutant protein."
+    },
+    {
+      "name": "atomicOPT",
+      "signature": "atomicOPT(residueList=None)",
+      "params": [
+        {
+          "name": "residueList",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Optimize the geometry by energy-minimizing the protein with an AMBER force field."
+    },
+    {
+      "name": "downloadTemplate",
+      "signature": "downloadTemplate(name)",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "default": null
+        }
+      ],
+      "doc": "Attempt to download a residue definition from the PDB and register a template for it."
+    },
+    {
+      "name": "findMissingAtoms",
+      "signature": "findMissingAtoms()",
+      "params": [],
+      "doc": "Find heavy atoms that are missing from the structure."
+    },
+    {
+      "name": "findMissingResidues",
+      "signature": "findMissingResidues()",
+      "params": [],
+      "doc": "Find residues that are missing from the structure."
+    },
+    {
+      "name": "findNonstandardResidues",
+      "signature": "findNonstandardResidues()",
+      "params": [],
+      "doc": "Identify non-standard residues found in the structure, and select standard residues to replace them with."
+    },
+    {
+      "name": "registerTemplate",
+      "signature": "registerTemplate(topology, positions, terminal=None)",
+      "params": [
+        {
+          "name": "topology",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "positions",
+          "required": true,
+          "default": null
+        },
+        {
+          "name": "terminal",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Register a template for a nonstandard residue.  This allows PDBFixer to add missing residues of this type,"
+    },
+    {
+      "name": "removeChains",
+      "signature": "removeChains(chainIndices=None, chainIds=None)",
+      "params": [
+        {
+          "name": "chainIndices",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "chainIds",
+          "required": false,
+          "default": null
+        }
+      ],
+      "doc": "Remove a set of chains from the structure."
+    },
+    {
+      "name": "removeHeterogens",
+      "signature": "removeHeterogens(keepWater=True, keepCoenzyme=False)",
+      "params": [
+        {
+          "name": "keepWater",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "keepCoenzyme",
+          "required": false,
+          "default": false
+        }
+      ],
+      "doc": "Remove heterogens (non-polymer residues) from the structure."
+    },
+    {
+      "name": "replaceNonstandardResidues",
+      "signature": "replaceNonstandardResidues()",
+      "params": [],
+      "doc": "Replace every residue listed in the nonstandardResidues field with the specified standard residue."
+    }
+  ],
+  "notes": {
+    "typical_order": [
+      "findMissingResidues",
+      "(set missingResidues={} to skip loops)",
+      "findNonstandardResidues",
+      "replaceNonstandardResidues",
+      "removeHeterogens",
+      "findMissingAtoms",
+      "addMissingAtoms",
+      "addMissingHydrogens",
+      "addHydrogensToLigands",
+      "atomicOPT"
+    ],
+    "addMissingHydrogens": "Hydrogenates protein residues and chain caps (ACE/NME/NH2/NMA/FOR). Ligands are left untouched.",
+    "addHydrogensToLigands": "templates = {residueName: SMILES_string_or_RDKit_Mol}. Only named ligands are hydrogenated; heavy-atom positions are never changed; fully offline (no CCD/network); returns {residueName: numHydrogensAdded}. Requires rdkit (lazy import).",
+    "key_attributes": [
+      "topology",
+      "positions",
+      "missingResidues",
+      "missingAtoms",
+      "sequences"
+    ],
+    "write_output": [
+      "from openmm.app import PDBFile, PDBxFile",
+      "PDBFile.writeFile(fixer.topology, fixer.positions, open('out.pdb','w'))",
+      "PDBxFile.writeFile(fixer.topology, fixer.positions, open('out.cif','w'))"
+    ]
+  }
+}
