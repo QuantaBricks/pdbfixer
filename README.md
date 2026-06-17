@@ -23,32 +23,69 @@ This fork (QuantaBricks/pdbfixer) adds a few capabilities on top of upstream PDB
 All existing method signatures are unchanged; the items below are additive (the only
 removed method relative to earlier fork revisions is `addMissingHydrogens2`).
 
-### Hydrogenating ligands with RDKit — `addHydrogensToLigands`
+### Which method hydrogenates what
 
-`addMissingHydrogens` protonates standard polymer residues **and protein chain caps**
-(`ACE`, `NME`, `NH2`, `NMA`, `FOR`), but deliberately leaves ligands/heterogens
-untouched: the hydrogen topology of an arbitrary small molecule cannot be recovered
-reliably from heavy-atom coordinates alone.
+| Method | Hydrogenates | Needs network / CCD |
+| --- | --- | --- |
+| `addMissingHydrogens(pH=7.0)` | protein residues **and chain caps** (`ACE`, `NME`, `NH2`, `NMA`, `FOR`); ligands left untouched | no (for standard residues) |
+| `addHydrogensToLigands(templates)` | ligands/heterogens you supply a SMILES (or RDKit `Mol`) for | **no — fully offline** |
 
-`addHydrogensToLigands` fills that gap for molecules whose chemistry you already know
-(e.g. ligands you generated yourself). You supply a reference structure per residue
-name; RDKit transfers its bond orders onto the matching heavy atoms and places
-hydrogens at 3D positions. It runs **fully offline** — no Chemical Component Dictionary
-or network access is used.
+The two are independent. Call only `addMissingHydrogens` to protonate the protein and
+leave ligands bare; add `addHydrogensToLigands` when you also want the ligands
+hydrogenated.
+
+### Hydrogenating the protein — `addMissingHydrogens`
 
 ```python
 from pdbfixer import PDBFixer
 
-fixer = PDBFixer(filename='complex.pdb')
-fixer.addMissingHydrogens(7.0)                          # protein + chain caps
-fixer.addHydrogensToLigands({'LIG': 'CC(=O)Oc1ccccc1C(=O)O'})  # ligand, via RDKit
+fixer = PDBFixer(filename='protein.pdb')
+fixer.findMissingResidues(); fixer.missingResidues = {}   # skip loop building
+fixer.findMissingAtoms(); fixer.addMissingAtoms()
+fixer.addMissingHydrogens(7.0)                            # protein + chain caps
 ```
 
-The template value may be a SMILES string or an RDKit `Mol`, and must contain exactly
-the same heavy atoms as the residue in the model (hydrogens in the reference are
-ignored). A ligand with no matching template is left unchanged. This requires
-[RDKit](https://www.rdkit.org/) (`pip install rdkit`); it is imported lazily, so RDKit
-is only needed if you call this method.
+Standard amino acids and the chain caps `ACE`/`NME`/`NH2`/`NMA`/`FOR` are hydrogenated;
+ligands, ions, and other heterogens are carried over unchanged (no hydrogens added).
+
+### Hydrogenating ligands with RDKit — `addHydrogensToLigands`
+
+The hydrogen topology of an arbitrary small molecule **cannot** be recovered reliably
+from heavy-atom coordinates alone (bond orders are ambiguous). So instead of guessing,
+you supply the chemistry you already know — a SMILES string (or RDKit `Mol`) per ligand
+residue name. RDKit transfers its bond orders onto the matching heavy atoms and adds the
+hydrogens. It runs **fully offline**: no Chemical Component Dictionary, no network.
+
+```python
+fixer = PDBFixer(filename='complex.pdb')
+fixer.addMissingHydrogens(7.0)                                    # protein + caps
+added = fixer.addHydrogensToLigands({'LIG': 'CC(=O)Oc1ccccc1C(=O)O'})
+# added == {'LIG': 8}  -> 8 hydrogens were added to residue LIG
+```
+
+Multiple ligands at once — only the residues you provide a SMILES for are touched:
+
+```python
+fixer.addHydrogensToLigands({
+    'BEN': 'c1ccc(cc1)C(=N)N',     # benzamidine
+    'LIG': 'CC(=O)Oc1ccccc1C(=O)O' # aspirin
+})
+```
+
+Behaviour and guarantees:
+
+- **Heavy-atom positions are never changed.** Only the new hydrogens get coordinates;
+  every existing heavy atom keeps its exact input position.
+- The template value may be a **SMILES string** or an **RDKit `Mol`**. Hydrogens in the
+  template are ignored.
+- The template must contain **exactly the same heavy atoms** (same element graph) as the
+  residue in the model. If the count/graph does not match, that ligand is **left
+  unchanged** and a warning is printed — the structure is never corrupted.
+- A ligand with **no** entry in `templates` is left unchanged. This is the control:
+  only ligands you name (and provide a SMILES for) are hydrogenated.
+- Returns a dict mapping residue name -> number of hydrogens added.
+- Requires [RDKit](https://www.rdkit.org/) (`pip install rdkit`); it is imported lazily,
+  so RDKit is only needed if you actually call this method.
 
 ### Removing heterogens — `removeHeterogens`
 
@@ -64,7 +101,7 @@ independently. Standard polymer residues and protein chain caps are always kept.
 
 ### Putting it together
 
-A typical preparation that removes solvent but keeps and hydrogenates a known ligand:
+Remove water, keep the ligand, hydrogenate protein **and** ligand, then minimize:
 
 ```python
 fixer = PDBFixer(pdbid='3PTB')
@@ -72,12 +109,28 @@ fixer.removeHeterogens(keepWater=False, keepCoenzyme=True)   # drop water, keep 
 fixer.findMissingResidues(); fixer.missingResidues = {}
 fixer.findMissingAtoms(); fixer.addMissingAtoms()
 fixer.addMissingHydrogens(7.0)                               # protein + caps
-fixer.addHydrogensToLigands({'BEN': 'c1ccc(cc1)C(=N)N'})     # ligand
+fixer.addHydrogensToLigands({'BEN': 'c1ccc(cc1)C(=N)N'})     # ligand (heavy atoms unmoved)
 fixer.atomicOPT()                                            # energy-minimize (optional)
 ```
 
-If you remove the ligands instead, you do not need a template or RDKit at all — just
-`removeHeterogens(...)` followed by `addMissingHydrogens`.
+Remove water **and** ligands, then hydrogenate the protein only (no SMILES / RDKit
+needed, because nothing but protein remains):
+
+```python
+fixer = PDBFixer(pdbid='3PTB')
+fixer.removeHeterogens(keepWater=False, keepCoenzyme=False)  # drop water + ligands
+fixer.findMissingResidues(); fixer.missingResidues = {}
+fixer.findMissingAtoms(); fixer.addMissingAtoms()
+fixer.addMissingHydrogens(7.0)                              # protein + caps
+```
+
+Write the result out (PDB or PDBx/mmCIF):
+
+```python
+from openmm.app import PDBFile, PDBxFile
+PDBFile.writeFile(fixer.topology, fixer.positions, open('out.pdb', 'w'))
+# or:  PDBxFile.writeFile(fixer.topology, fixer.positions, open('out.cif', 'w'))
+```
 
 ## Installation
 
