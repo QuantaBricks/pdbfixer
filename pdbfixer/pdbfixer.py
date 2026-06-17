@@ -84,6 +84,17 @@ substitutions = {
 proteinResidues = ['ALA', 'ASN', 'CYS', 'GLU', 'HIS', 'LEU', 'MET', 'PRO', 'THR', 'TYR', 'ARG', 'ASP', 'GLN', 'GLY', 'ILE', 'LYS', 'PHE', 'SER', 'TRP', 'VAL']
 rnaResidues = ['A', 'G', 'C', 'U', 'I']
 dnaResidues = ['DA', 'DG', 'DC', 'DT', 'DI']
+# Terminal capping groups that are part of a protein chain and should be hydrogenated
+# along with the standard amino acids (but, unlike ligands, are not arbitrary heterogens).
+proteinCaps = ['ACE', 'NME', 'NH2', 'NMA', 'FOR']
+# Residues to hydrogenate in addMissingHydrogens: standard amino acids plus chain caps.
+# Deliberately excludes ligands/heterogens so they are left untouched.
+hydrogenatedProteinResidues = set(proteinResidues) | set(proteinCaps)
+
+# Standard polymer residues and solvent that addHydrogensToLigands must never touch
+# (proteins/caps are handled by addMissingHydrogens; nucleic acids and water too).
+_standardResidues = (set(proteinResidues) | set(proteinCaps) |
+                     set(dnaResidues) | set(rnaResidues) | {'HOH', 'WAT', 'DOD'})
 
 class Sequence(object):
     """Sequence holds the sequence of a chain, as specified by SEQRES records."""
@@ -169,7 +180,7 @@ class CCDResidueDefinition:
                 symbol=row[symbolCol],
                 leaving=row[leavingCol] == 'Y',
                 coords=mm.Vec3(float(row[xCol]), float(row[yCol]), float(row[zCol]))*0.1,
-                charge=row[chargeCol],
+                charge=row[chargeCol] if row[chargeCol] != "?" else 0,
                 aromatic=row[aromaticCol] == 'Y'
             ) for row in atomData.getRowList()
         ]
@@ -377,7 +388,7 @@ class PDBFixer(object):
             file.close()
             file = StringIO(contents)
             if _guessFileFormat(file, url) == 'pdbx':
-                self._initializeFromPDBx(contents)
+                self._initializeFromPDBx(StringIO(contents))
             else:
                 self._initializeFromPDB(StringIO(contents))
 
@@ -1332,13 +1343,15 @@ class PDBFixer(object):
             self.topology = newTopology2
             self.positions = newPositions2
 
-    def removeHeterogens(self, keepWater=True,keepCoenzyme=False):
-        """Remove all heterogens from the structure.
+    def removeHeterogens(self, keepWater=True, keepCoenzyme=False):
+        """Remove heterogens (non-polymer residues) from the structure.
 
         Parameters
         ----------
         keepWater : bool, optional, default=True
             If True, water molecules will not be removed.
+        keepCoenzyme : bool, optional, default=False
+            If True, coenzymes/ligands (heterogens other than water) will not be removed.
 
         Returns
         -------
@@ -1353,82 +1366,32 @@ class PDBFixer(object):
         >>> fixer.removeHeterogens(keepWater=False)
 
         """
-        # If water and coenzymes are kept, do noting.
-        if (keepWater and keepCoenzyme): 
-            return ([])
-        
-        # Remove Coenzymes (ligands),keep waters
-        if(not keepWater and not keepCoenzyme):
-            keep = set(proteinResidues).union(dnaResidues).union(rnaResidues)
-            keep.add('N')
-            keep.add('UNK')
-            toDelete = []
-            for residue in self.topology.residues():
-                if residue.name not in keep:
-                    toDelete.append(residue)
-            modeller = app.Modeller(self.topology, self.positions)
-            modeller.delete(toDelete)
-            self.topology = modeller.topology
-            self.positions = modeller.positions
-            return toDelete
-        
-        # Remove Coenzymes (ligands),keep waters
-        if(keepWater and not keepCoenzyme):
-            keep = set(proteinResidues).union(dnaResidues).union(rnaResidues)
-            keep.add('N')
-            keep.add('UNK')
+        # Build the set of residue names to keep.  Chain caps (ACE/NME/...) are part
+        # of the protein chain, not ligands, so they are kept even when removing
+        # heterogens -- consistent with addMissingHydrogens hydrogenating them.
+        keep = set(proteinResidues).union(dnaResidues).union(rnaResidues).union(proteinCaps)
+        keep.add('N')
+        keep.add('UNK')
+        if keepWater:
             keep.add('HOH')
-            toDelete = []
-            for residue in self.topology.residues():
-                if residue.name not in keep:
+
+        toDelete = []
+        for residue in self.topology.residues():
+            if residue.name == 'HOH':
+                # Water is governed solely by keepWater.
+                if not keepWater:
                     toDelete.append(residue)
+            elif residue.name not in keep:
+                # Any other heterogen is governed by keepCoenzyme.
+                if not keepCoenzyme:
+                    toDelete.append(residue)
+
+        if toDelete:
             modeller = app.Modeller(self.topology, self.positions)
             modeller.delete(toDelete)
             self.topology = modeller.topology
             self.positions = modeller.positions
-            return toDelete
-        
-        # Remove Waters and Coenzyme 
-        if (not keepWater and keepCoenzyme):
-            toDelete = []
-            for residue in self.topology.residues():
-                if residue.name == 'HOH':
-                    toDelete.append(residue)
-            modeller = app.Modeller(self.topology, self.positions)
-            modeller.delete(toDelete)
-            self.topology = modeller.topology
-            self.positions = modeller.positions
-            return toDelete
-
-    def addMissingHydrogens2(self, pH=7.0, forcefield=None):
-        """Add missing hydrogen atoms to the structure.
-
-        Parameters
-        ----------
-        pH : float, optional, default=7.0
-            The pH based on which to select hydrogens.
-        forcefield : ForceField, optional, default=None
-            The forcefield used when adding and minimizing hydrogens. If None, a default forcefield is used.
-
-        Notes
-        -----
-        No extensive electrostatic analysis is performed; only default residue pKas are used.  The pH is only
-        taken into account for standard amino acids.
-
-        Examples
-        --------
-
-        Add missing hydrogens appropriate for pH 8.
-
-        >>> fixer = PDBFixer(pdbid='1VII')
-        >>> fixer.addMissingHydrogens(pH=8.0)
-        """
-        extraDefinitions = self._downloadNonstandardDefinitions()
-        variants = [self._describeVariant(res, extraDefinitions) for res in self.topology.residues()]
-        modeller = app.Modeller(self.topology, self.positions)
-        modeller.addHydrogens(pH=pH, forcefield=forcefield, variants=variants, platform=self.platform)
-        self.topology = modeller.topology
-        self.positions = modeller.positions
+        return toDelete
 
     def addMissingHydrogens(self, pH=7.0, forcefield=None):
         """Add missing hydrogen atoms to the structure.
@@ -1457,9 +1420,11 @@ class PDBFixer(object):
         variants = []
         protein_atoms = []
         
-        # First pass: identify protein atoms and residues
+        # First pass: identify protein atoms and residues (standard amino acids plus
+        # chain caps such as ACE/NME; ligands and other heterogens are excluded so they
+        # are never hydrogenated here).
         for atom in self.topology.atoms():
-            if atom.residue.name in proteinResidues:
+            if atom.residue.name in hydrogenatedProteinResidues:
                 protein_atoms.append(atom.index)
         
         # Create a Modeller with only protein atoms
@@ -1495,8 +1460,8 @@ class PDBFixer(object):
             atom_map = {}
             for residue in self.topology.residues():
                 new_residue = new_topology.addResidue(residue.name, chain_map[residue.chain], residue.id, residue.insertionCode)
-                
-                if residue.name in proteinResidues:
+
+                if residue.name in hydrogenatedProteinResidues:
                     # Find matching residue in modeller
                     mod_res = None
                     for mr in modeller.topology.residues():
@@ -1532,6 +1497,241 @@ class PDBFixer(object):
         else:
             self.topology = modeller.topology
             self.positions = modeller.positions
+
+    def addHydrogensToLigands(self, templates, residueNames=None):
+        """Add hydrogen atoms to ligand/heterogen residues using RDKit.
+
+        ``addMissingHydrogens`` only protonates standard polymer residues and chain
+        caps, because the hydrogen topology of an arbitrary small molecule is not
+        known a priori: a PDB file records only heavy-atom coordinates, and the
+        protonation/bond orders of a novel molecule cannot be recovered reliably
+        from geometry alone.  This method fills that gap for molecules whose chemical
+        identity you already know (e.g. ligands you generated yourself): you supply a
+        reference structure per residue name, RDKit transfers its bond orders onto the
+        matching heavy atoms in the model, and hydrogens are placed at chemically
+        reasonable 3D positions.  It works fully offline -- no Chemical Component
+        Dictionary or network access is used.
+
+        Parameters
+        ----------
+        templates : dict
+            Maps ligand residue name -> reference structure used to assign bond
+            orders.  Each value may be a SMILES string or an RDKit ``Mol``.  The
+            reference must contain exactly the same heavy atoms (same element graph)
+            as the residue in the model; hydrogens in the reference are ignored.
+        residueNames : iterable of str, optional
+            If given, only process residues whose name is in this set (they must
+            still appear in ``templates``).  If None (default), every residue named
+            in ``templates`` is processed.
+
+        Returns
+        -------
+        dict
+            Maps residue name -> number of hydrogens added, for residues that were
+            successfully processed.  Residues without a template, or whose template
+            does not match, are left unchanged and reported with a warning.
+
+        Examples
+        --------
+
+        >>> fixer = PDBFixer(pdbid='2F4J')
+        >>> fixer.addMissingHydrogens(7.0)                       # protein + caps
+        >>> fixer.addHydrogensToLigands({'VX6': 'Cc1ccc...'})    # ligand, via RDKit
+        """
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit.Chem import rdDetermineBonds
+        from rdkit.Geometry import Point3D
+
+        if not templates:
+            return {}
+        targetNames = set(residueNames) if residueNames is not None else None
+        hydrogen = app.element.hydrogen
+
+        # ``self.positions`` is a Quantity of Vec3 in nm; cache plain nm values.
+        posNm = self.positions.value_in_unit(unit.nanometer)
+
+        # perceived[residue] = (heavyAtoms, addedHydrogens, bonds)
+        #   heavyAtoms       : list of original Atom objects, RDKit index = list index
+        #   addedHydrogens   : list of (rdkitIndex, name, Vec3-in-nm)
+        #   bonds            : list of (rdkitIndexA, rdkitIndexB) covering the whole mol
+        perceived = {}
+        added = {}
+        warnings = []
+
+        for residue in self.topology.residues():
+            name = residue.name
+            if name not in templates:
+                continue
+            if targetNames is not None and name not in targetNames:
+                continue
+
+            heavyAtoms = [a for a in residue.atoms()
+                          if a.element is not None and a.element is not hydrogen]
+            # Skip residues that are already protonated or are monatomic ions.
+            if any(a.element is hydrogen for a in residue.atoms()):
+                continue
+            if len(heavyAtoms) < 2:
+                continue
+
+            try:
+                molH, bonds = self._buildLigandWithHs(
+                    heavyAtoms, posNm, templates[name],
+                    Chem, AllChem, rdDetermineBonds, Point3D)
+            except Exception as e:
+                warnings.append(f"{name}: {type(e).__name__}: {e}")
+                continue
+
+            nHeavy = len(heavyAtoms)
+            conf = molH.GetConformer()
+            usedNames = {a.name for a in residue.atoms()}
+            counters = {}
+            addedHs = []
+            for atom in molH.GetAtoms():
+                idx = atom.GetIdx()
+                if idx < nHeavy:
+                    continue  # original heavy atom
+                # Each added hydrogen is bonded to exactly one heavy parent.
+                parentIdx = atom.GetNeighbors()[0].GetIdx()
+                hName = self._nameLigandHydrogen(
+                    heavyAtoms[parentIdx].name, counters, usedNames)
+                p = conf.GetAtomPosition(idx)
+                addedHs.append((idx, hName, mm.Vec3(p.x, p.y, p.z) * 0.1))
+            if not addedHs:
+                continue
+            perceived[residue] = (heavyAtoms, addedHs, bonds)
+            added[name] = added.get(name, 0) + len(addedHs)
+
+        if not perceived:
+            if warnings:
+                print("addHydrogensToLigands: no ligands hydrogenated; "
+                      + "; ".join(warnings))
+            return added
+
+        # Rebuild the topology, inserting the new hydrogens into their residues and
+        # giving each processed ligand a complete RDKit-perceived bond graph.
+        newTopology = app.Topology()
+        newTopology.setPeriodicBoxVectors(self.topology.getPeriodicBoxVectors())
+        newPositions = [] * unit.nanometer
+        atomMap = {}
+        processed = set(perceived)
+        for chain in self.topology.chains():
+            newChain = newTopology.addChain(chain.id)
+            for residue in chain.residues():
+                newResidue = newTopology.addResidue(
+                    residue.name, newChain, residue.id, residue.insertionCode)
+                if residue in perceived:
+                    heavyAtoms, addedHs, bonds = perceived[residue]
+                    localMap = {}
+                    for rdkitIdx, atom in enumerate(heavyAtoms):
+                        newAtom = newTopology.addAtom(
+                            atom.name, atom.element, newResidue)
+                        atomMap[atom] = newAtom
+                        localMap[rdkitIdx] = newAtom
+                        newPositions.append(self.positions[atom.index])
+                    for rdkitIdx, hName, posVec in addedHs:
+                        newAtom = newTopology.addAtom(hName, hydrogen, newResidue)
+                        localMap[rdkitIdx] = newAtom
+                        newPositions.append(posVec * unit.nanometer)
+                    for a, b in bonds:
+                        newTopology.addBond(localMap[a], localMap[b])
+                else:
+                    for atom in residue.atoms():
+                        newAtom = newTopology.addAtom(
+                            atom.name, atom.element, newResidue)
+                        atomMap[atom] = newAtom
+                        newPositions.append(self.positions[atom.index])
+
+        # Preserve existing bonds, except inside residues we just rebuilt (whose
+        # bonds were added from the perceived graph above).
+        for bond in self.topology.bonds():
+            a, b = bond[0], bond[1]
+            if a.residue in processed and b.residue in processed:
+                continue
+            if a in atomMap and b in atomMap:
+                newTopology.addBond(atomMap[a], atomMap[b])
+
+        self.topology = newTopology
+        self.positions = newPositions
+        if warnings:
+            print("addHydrogensToLigands: could not perceive "
+                  + "; ".join(warnings))
+        return added
+
+    def _buildLigandWithHs(self, heavyAtoms, posNm, template,
+                           Chem, AllChem, rdDetermineBonds, Point3D):
+        """Hydrogenate one ligand by transferring bond orders from a reference.
+
+        ``template`` is a SMILES string or an RDKit ``Mol`` describing the same heavy
+        atoms as ``heavyAtoms``.  A bare molecule is built from the model's heavy-atom
+        coordinates, its connectivity is perceived from geometry, the reference's bond
+        orders are mapped on, and hydrogens are added with 3D coordinates.
+
+        Returns ``(molWithHs, bonds)`` where ``bonds`` is the list of
+        (atomIndexA, atomIndexB) tuples for the hydrogenated molecule.
+        """
+        reference = Chem.MolFromSmiles(template) if isinstance(template, str) else template
+        if reference is None:
+            raise ValueError("could not parse template")
+        nRefHeavy = sum(1 for a in reference.GetAtoms() if a.GetAtomicNum() > 1)
+        if nRefHeavy != len(heavyAtoms):
+            raise ValueError(
+                f"template has {nRefHeavy} heavy atoms but residue has {len(heavyAtoms)}")
+
+        # Bare molecule: the model's heavy atoms with their 3D coordinates, no bonds.
+        rw = Chem.RWMol()
+        for atom in heavyAtoms:
+            rw.AddAtom(Chem.Atom(atom.element.atomic_number))
+        conf = Chem.Conformer(len(heavyAtoms))
+        for i, atom in enumerate(heavyAtoms):
+            x, y, z = posNm[atom.index]
+            conf.SetAtomPosition(i, Point3D(x * 10.0, y * 10.0, z * 10.0))  # nm -> Angstrom
+        bare = rw.GetMol()
+        bare.AddConformer(conf, assignId=True)
+
+        # Perceive connectivity from geometry, then map the reference's bond orders on.
+        # A small covalent-radius sweep tolerates slightly long/short model bonds.
+        lastError = None
+        for covFactor in (1.3, 1.35, 1.4):
+            trial = Chem.Mol(bare)
+            try:
+                rdDetermineBonds.DetermineConnectivity(trial, covFactor=covFactor)
+                mol = AllChem.AssignBondOrdersFromTemplate(reference, trial)
+            except (ValueError, RuntimeError) as e:
+                lastError = e
+                continue
+
+            # DetermineConnectivity leaves atoms flagged as having no implicit Hs and
+            # may place radical electrons; clear both so AddHs fills open valences.
+            mol = Chem.RWMol(mol)
+            for a in mol.GetAtoms():
+                a.SetNoImplicit(False)
+                a.SetNumRadicalElectrons(0)
+            mol = mol.GetMol()
+            Chem.SanitizeMol(mol)
+
+            molH = Chem.AddHs(mol, addCoords=True)
+            bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in molH.GetBonds()]
+            return molH, bonds
+        raise ValueError(f"could not match template to geometry: {lastError}")
+
+    @staticmethod
+    def _nameLigandHydrogen(parentName, counters, usedNames):
+        """Generate a unique PDB-style hydrogen name attached to ``parentName``."""
+        core = ''.join(c for c in parentName if c.isalnum())
+        if core[:1].isalpha():
+            core = core[1:] or core  # drop the leading element letter when possible
+        base = ('H' + core)[:3]
+        k = counters.get(parentName, 0)
+        counters[parentName] = k + 1
+        candidate = base if k == 0 else f"{base}{chr(ord('A') + k - 1)}"
+        candidate = candidate[:4]
+        suffix = 0
+        while candidate in usedNames:
+            suffix += 1
+            candidate = f"{base[:2]}{suffix}"[:4]
+        usedNames.add(candidate)
+        return candidate
 
     def _downloadNonstandardDefinitions(self):
         """If the file contains any nonstandard residues, download their definitions and build
@@ -1830,126 +2030,103 @@ class PDBFixer(object):
 
 
     def atomicOPT(self, residueList=None):
-        """optmized geometry.
+        """Optimize the geometry by energy-minimizing the protein with an AMBER force field.
 
         Parameters
         ----------
-        resdueList : list, optional, default=None
-            If None, optmized all atoms (heavy and H atoms)
-            If a list provided, only the heavy atoms in the list and H atoms are optimized 
+        residueList : list, optional, default=None
+            Currently unused; reserved for restricting the optimization to a subset of residues.
 
         Notes
         -----
-            The added residues are not well optmized. 
-
+            Only protein residues are minimized; other components (water, ligands, ...) are
+            carried over unchanged.  Recently added residues may not be well optimized.
         """
+        import tempfile
         from openmm.app import ForceField
-        from openmm.app.forcefield import NoCutoff,HBonds
+        from openmm.app.forcefield import NoCutoff, HBonds
         from openmm.app.simulation import Simulation
         from openmm import LangevinMiddleIntegrator
         from openmm.app.pdbfile import PDBFile
-        from sys import stdout
 
-        extraDefinitions = self._downloadNonstandardDefinitions()
-        variants = []
-        protein_atoms = []
-        
-        # First pass: identify protein atoms and residues
-        for atom in self.topology.atoms():
-            if atom.residue.name in proteinResidues:
-                protein_atoms.append(atom.index)
-        
-        # Create a Modeller with only protein atoms
+        # Identify the protein atoms.
+        protein_atoms = [atom.index for atom in self.topology.atoms()
+                         if atom.residue.name in proteinResidues]
+
+        # Create a Modeller holding only the protein atoms.
         modeller = app.Modeller(self.topology, self.positions)
-        if len(protein_atoms) < self.topology.getNumAtoms():
-            # Only keep protein atoms
+        proteinOnly = len(protein_atoms) < self.topology.getNumAtoms()
+        if proteinOnly:
             to_delete = [atom for atom in self.topology.atoms() if atom.index not in protein_atoms]
             modeller.delete(to_delete)
-        
-        # Now add hydrogens only to protein residues
-        for res in modeller.topology.residues():
-            variant = self._describeVariant(res, extraDefinitions)
-            variants.append(variant)
 
-        PDBFile.writeFile(modeller.topology, modeller.positions, open('temp.pdb', 'w'))
-        # Do optimization 
-        pdb = PDBFile('temp.pdb')
+        # Round-trip through a PDB file so the topology matches the force field templates,
+        # then energy-minimize.
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as tmp:
+            tmpName = tmp.name
+            PDBFile.writeFile(modeller.topology, modeller.positions, tmp)
+        try:
+            pdb = PDBFile(tmpName)
+        finally:
+            os.remove(tmpName)
+
         forcefield = ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
-        #system = forcefield.createSystem(modeller.topology, nonbondedMethod=NoCutoff, nonbondedCutoff=1*unit.nanometer, constraints=HBonds)
         system = forcefield.createSystem(pdb.topology, nonbondedMethod=NoCutoff, nonbondedCutoff=1*unit.nanometer, constraints=HBonds)
         integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.004*unit.picoseconds)
-        #simulation = Simulation(modeller.topology, system, integrator)
         simulation = Simulation(pdb.topology, system, integrator)
         simulation.context.setPositions(pdb.positions)
-        #simulation.context.setPositions(modeller.positions)
         simulation.minimizeEnergy(tolerance=100 * unit.kilojoule/unit.mole/unit.nanometer)
         state = simulation.context.getState(getPositions=True, getEnergy=True)
 
-
-        #modeller.addHydrogens(pH=pH, forcefield=forcefield, variants=variants, platform=self.platform)
         modeller.topology = simulation.topology
         modeller.positions = state.getPositions()
-        # Merge back the original non-protein atoms with the new protein atoms that have hydrogens
-        if len(protein_atoms) < self.topology.getNumAtoms():
-        #if False:
-            # Create a new topology combining original non-protein atoms with modified protein atoms
-            new_topology = app.Topology()
-            new_positions = []*unit.nanometer
-            
-            # Copy chains
-            chain_map = {}
-            for chain in self.topology.chains():
-                new_chain = new_topology.addChain(chain.id)
-                chain_map[chain] = new_chain
-        
 
-            # Copy residues and atoms
-            atom_map = {}
-            proteir_resID_ori = 0
-            for residue in self.topology.residues():
-                new_residue = new_topology.addResidue(residue.name, chain_map[residue.chain], residue.id, residue.insertionCode)
-                proteir_resID_ori = proteir_resID_ori + 1
-                
-                if residue.name in proteinResidues:
-                    # Find matching residue in modeller
-                    mod_res = None
-                    proteir_resID_new = 0
-                    for mr in modeller.topology.residues():
-                        print(mr.name,residue.name, mr.id, residue.id, mr.chain.id, residue.chain.id,proteir_resID_new,proteir_resID_ori)
-                        proteir_resID_new = proteir_resID_new+1
-                        if (mr.name == residue.name and 
-                            proteir_resID_new == proteir_resID_ori  and # Some are not start from zero 
-                            mr.chain.id == residue.chain.id):
-                            mod_res = mr
-                            break
-                    
-                    if mod_res is None:
-                        raise ValueError(f"Could not find matching residue {residue.name} {residue.id} in modeller")
-                    
-                    # Add all atoms from modeller residue (including new hydrogens)
-                    for mod_atom in mod_res.atoms():
-                        new_atom = new_topology.addAtom(mod_atom.name, mod_atom.element, new_residue)
-                        atom_map[mod_atom] = new_atom
-                        new_positions.append(modeller.positions[mod_atom.index])
-
-                
-                # Handle non-protein residues (original atoms)
-                else:
-                    for atom in residue.atoms():
-                        new_atom = new_topology.addAtom(atom.name, atom.element, new_residue)
-                        atom_map[atom] = new_atom
-                        new_positions.append(self.positions[atom.index])
-            
-            # Copy bonds
-            #for bond in self.topology.bonds():
-            #    if bond[0] in atom_map and bond[1] in atom_map:
-            #        new_topology.addBond(atom_map[bond[0]], atom_map[bond[1]])
-            
-            self.topology = new_topology
-            self.positions = new_positions
-        else:
+        if not proteinOnly:
+            # Nothing but protein, so the minimized structure is the whole result.
             self.topology = modeller.topology
             self.positions = modeller.positions
+            return
+
+        # Merge the minimized protein atoms back with the original non-protein atoms.
+        new_topology = app.Topology()
+        new_positions = []*unit.nanometer
+
+        chain_map = {}
+        for chain in self.topology.chains():
+            chain_map[chain] = new_topology.addChain(chain.id)
+
+        proteinResIndex = 0
+        for residue in self.topology.residues():
+            new_residue = new_topology.addResidue(residue.name, chain_map[residue.chain], residue.id, residue.insertionCode)
+            proteinResIndex += 1
+
+            if residue.name in proteinResidues:
+                # Find the matching residue in the minimized model.  Residue ids are not
+                # guaranteed to start at zero, so match on positional order within the model.
+                mod_res = None
+                modResIndex = 0
+                for mr in modeller.topology.residues():
+                    modResIndex += 1
+                    if (mr.name == residue.name and
+                            modResIndex == proteinResIndex and
+                            mr.chain.id == residue.chain.id):
+                        mod_res = mr
+                        break
+
+                if mod_res is None:
+                    raise ValueError(f"Could not find matching residue {residue.name} {residue.id} in modeller")
+
+                for mod_atom in mod_res.atoms():
+                    new_topology.addAtom(mod_atom.name, mod_atom.element, new_residue)
+                    new_positions.append(modeller.positions[mod_atom.index])
+            else:
+                # Non-protein residue: carry over the original atoms unchanged.
+                for atom in residue.atoms():
+                    new_topology.addAtom(atom.name, atom.element, new_residue)
+                    new_positions.append(self.positions[atom.index])
+
+        self.topology = new_topology
+        self.positions = new_positions
 
 
 
