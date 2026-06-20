@@ -90,6 +90,11 @@ proteinCaps = ['ACE', 'NME', 'NH2', 'NMA', 'FOR']
 # Residues to hydrogenate in addMissingHydrogens: standard amino acids plus chain caps.
 # Deliberately excludes ligands/heterogens so they are left untouched.
 hydrogenatedProteinResidues = set(proteinResidues) | set(proteinCaps)
+# Standard polymer residues that addMissingHydrogens handles via OpenMM's Modeller:
+# proteins/caps plus standard nucleic acids.  Ligands/heterogens are still excluded
+# (they go through addHydrogensToLigands instead).
+hydrogenatedStandardResidues = (hydrogenatedProteinResidues |
+                                set(dnaResidues) | set(rnaResidues))
 
 # Standard polymer residues and solvent that addHydrogensToLigands must never touch
 # (proteins/caps are handled by addMissingHydrogens; nucleic acids and water too).
@@ -1420,11 +1425,11 @@ class PDBFixer(object):
         variants = []
         protein_atoms = []
         
-        # First pass: identify protein atoms and residues (standard amino acids plus
-        # chain caps such as ACE/NME; ligands and other heterogens are excluded so they
-        # are never hydrogenated here).
+        # First pass: identify standard polymer atoms and residues (amino acids plus
+        # chain caps such as ACE/NME, and standard nucleic acids; ligands and other
+        # heterogens are excluded so they are never hydrogenated here).
         for atom in self.topology.atoms():
-            if atom.residue.name in hydrogenatedProteinResidues:
+            if atom.residue.name in hydrogenatedStandardResidues:
                 protein_atoms.append(atom.index)
         
         # Create a Modeller with only protein atoms
@@ -1461,7 +1466,7 @@ class PDBFixer(object):
             for residue in self.topology.residues():
                 new_residue = new_topology.addResidue(residue.name, chain_map[residue.chain], residue.id, residue.insertionCode)
 
-                if residue.name in hydrogenatedProteinResidues:
+                if residue.name in hydrogenatedStandardResidues:
                     # Find matching residue in modeller
                     mod_res = None
                     for mr in modeller.topology.residues():
@@ -2039,8 +2044,9 @@ class PDBFixer(object):
 
         Notes
         -----
-            Only protein residues are minimized; other components (water, ligands, ...) are
-            carried over unchanged.  Recently added residues may not be well optimized.
+            Only standard polymer residues (proteins and nucleic acids) are minimized;
+            other components (water, ligands, ...) are carried over unchanged.  Recently
+            added residues may not be well optimized.
         """
         import tempfile
         from openmm.app import ForceField
@@ -2049,11 +2055,14 @@ class PDBFixer(object):
         from openmm import LangevinMiddleIntegrator
         from openmm.app.pdbfile import PDBFile
 
-        # Identify the protein atoms.
-        protein_atoms = [atom.index for atom in self.topology.atoms()
-                         if atom.residue.name in proteinResidues]
+        # Residues handled by the AMBER force field: proteins plus standard nucleic acids.
+        minimizedResidues = set(proteinResidues) | set(dnaResidues) | set(rnaResidues)
 
-        # Create a Modeller holding only the protein atoms.
+        # Identify the polymer atoms to minimize.
+        protein_atoms = [atom.index for atom in self.topology.atoms()
+                         if atom.residue.name in minimizedResidues]
+
+        # Create a Modeller holding only the polymer atoms.
         modeller = app.Modeller(self.topology, self.positions)
         proteinOnly = len(protein_atoms) < self.topology.getNumAtoms()
         if proteinOnly:
@@ -2095,26 +2104,21 @@ class PDBFixer(object):
         for chain in self.topology.chains():
             chain_map[chain] = new_topology.addChain(chain.id)
 
-        proteinResIndex = 0
+        # The modeller contains only the minimized polymer residues, in the same
+        # relative order as in self.topology (it was built by deleting the other
+        # atoms).  Pair each polymer residue with the next modeller residue.
+        mod_residues = list(modeller.topology.residues())
+        modResIndex = 0
         for residue in self.topology.residues():
             new_residue = new_topology.addResidue(residue.name, chain_map[residue.chain], residue.id, residue.insertionCode)
-            proteinResIndex += 1
 
-            if residue.name in proteinResidues:
-                # Find the matching residue in the minimized model.  Residue ids are not
-                # guaranteed to start at zero, so match on positional order within the model.
-                mod_res = None
-                modResIndex = 0
-                for mr in modeller.topology.residues():
-                    modResIndex += 1
-                    if (mr.name == residue.name and
-                            modResIndex == proteinResIndex and
-                            mr.chain.id == residue.chain.id):
-                        mod_res = mr
-                        break
-
-                if mod_res is None:
+            if residue.name in minimizedResidues:
+                if modResIndex >= len(mod_residues):
                     raise ValueError(f"Could not find matching residue {residue.name} {residue.id} in modeller")
+                mod_res = mod_residues[modResIndex]
+                modResIndex += 1
+                if mod_res.name != residue.name:
+                    raise ValueError(f"Residue mismatch: {residue.name} {residue.id} vs minimized {mod_res.name} {mod_res.id}")
 
                 for mod_atom in mod_res.atoms():
                     new_topology.addAtom(mod_atom.name, mod_atom.element, new_residue)
