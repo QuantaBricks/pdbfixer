@@ -1667,57 +1667,109 @@ class PDBFixer(object):
 
     def _buildLigandWithHs(self, heavyAtoms, posNm, template,
                            Chem, AllChem, rdDetermineBonds, Point3D):
-        """Hydrogenate one ligand by transferring bond orders from a reference.
+        """Hydrogenate one ligand using a reference as the source of connectivity.
 
         ``template`` is a SMILES string or an RDKit ``Mol`` describing the same heavy
-        atoms as ``heavyAtoms``.  A bare molecule is built from the model's heavy-atom
-        coordinates, its connectivity is perceived from geometry, the reference's bond
-        orders are mapped on, and hydrogens are added with 3D coordinates.
+        atoms as ``heavyAtoms``.  The reference -- not the model geometry -- defines
+        the bonds: geometry is only used to (a) establish an atom correspondence
+        between the model and the reference via subgraph isomorphism, and (b) place
+        the added hydrogens in 3D.  The final molecule's bonds are taken entirely from
+        the reference, so distorted poses (e.g. docking results with clashing/overlong
+        contacts) cannot introduce spurious bonds or valence conflicts.  The model's
+        heavy-atom order need not match the reference's; the correspondence is solved
+        for, not assumed.
 
         Returns ``(molWithHs, bonds)`` where ``bonds`` is the list of
-        (atomIndexA, atomIndexB) tuples for the hydrogenated molecule.
+        (atomIndexA, atomIndexB) tuples for the hydrogenated molecule.  Heavy atoms
+        keep their ``heavyAtoms`` order (index i == heavyAtoms[i]); hydrogens follow.
         """
         reference = Chem.MolFromSmiles(template) if isinstance(template, str) else template
         if reference is None:
             raise ValueError("could not parse template")
-        nRefHeavy = sum(1 for a in reference.GetAtoms() if a.GetAtomicNum() > 1)
+        # Kekulized copy: explicit single/double bonds and no aromatic flags, so we can
+        # read concrete bond orders and build a bond-order-agnostic matching query.
+        refK = Chem.Mol(reference)
+        try:
+            Chem.Kekulize(refK, clearAromaticFlags=True)
+        except Exception as e:
+            raise ValueError(f"could not kekulize template: {e}")
+        refK = Chem.RemoveHs(refK)
+        nRefHeavy = refK.GetNumAtoms()
         if nRefHeavy != len(heavyAtoms):
             raise ValueError(
                 f"template has {nRefHeavy} heavy atoms but residue has {len(heavyAtoms)}")
 
-        # Bare molecule: the model's heavy atoms with their 3D coordinates, no bonds.
+        # Bond-order-agnostic query (template connectivity, all bonds single) used only
+        # to find which model atom corresponds to which reference atom.
+        query = Chem.RWMol(refK)
+        for b in query.GetBonds():
+            b.SetBondType(Chem.BondType.SINGLE)
+            b.SetIsAromatic(False)
+        for a in query.GetAtoms():
+            a.SetIsAromatic(False)
+        query = query.GetMol()
+        Chem.FastFindRings(query)
+
+        # Model heavy atoms with their 3D coordinates (model order), no bonds yet.
+        coords = [Point3D(posNm[a.index][0] * 10.0,
+                          posNm[a.index][1] * 10.0,
+                          posNm[a.index][2] * 10.0) for a in heavyAtoms]  # nm -> Angstrom
         rw = Chem.RWMol()
         for atom in heavyAtoms:
             rw.AddAtom(Chem.Atom(atom.element.atomic_number))
-        conf = Chem.Conformer(len(heavyAtoms))
-        for i, atom in enumerate(heavyAtoms):
-            x, y, z = posNm[atom.index]
-            conf.SetAtomPosition(i, Point3D(x * 10.0, y * 10.0, z * 10.0))  # nm -> Angstrom
         bare = rw.GetMol()
+        conf = Chem.Conformer(len(heavyAtoms))
+        for i, p in enumerate(coords):
+            conf.SetAtomPosition(i, p)
         bare.AddConformer(conf, assignId=True)
 
-        # Perceive connectivity from geometry, then map the reference's bond orders on.
-        # A small covalent-radius sweep tolerates slightly long/short model bonds.
+        # Perceive connectivity only to obtain the atom correspondence.  Subgraph
+        # matching tolerates extra (spurious) bonds in the model graph, so a too-short
+        # non-bonded contact does not break the match; a covalent-radius sweep recovers
+        # any real bond that is overlong in a distorted pose.
         lastError = None
-        for covFactor in (1.3, 1.35, 1.4):
-            trial = Chem.Mol(bare)
+        for covFactor in (1.3, 1.35, 1.4, 1.5):
+            trial = Chem.RWMol(bare)
             try:
                 rdDetermineBonds.DetermineConnectivity(trial, covFactor=covFactor)
-                mol = AllChem.AssignBondOrdersFromTemplate(reference, trial)
+            except (ValueError, RuntimeError) as e:
+                lastError = e
+                continue
+            for a in trial.GetAtoms():
+                a.SetIsAromatic(False)
+                a.SetNoImplicit(False)
+                a.SetNumRadicalElectrons(0)
+            trial = trial.GetMol()
+            Chem.FastFindRings(trial)
+
+            # match[referenceIdx] = modelIdx
+            match = trial.GetSubstructMatch(query)
+            if not match or len(match) != nRefHeavy:
+                lastError = ValueError("template did not embed in perceived graph")
+                continue
+
+            # Rebuild the molecule in model-atom order using the reference's bonds only.
+            out = Chem.RWMol()
+            for atom in heavyAtoms:
+                out.AddAtom(Chem.Atom(atom.element.atomic_number))
+            for b in refK.GetBonds():
+                out.AddBond(match[b.GetBeginAtomIdx()], match[b.GetEndAtomIdx()],
+                            b.GetBondType())
+            for refIdx in range(nRefHeavy):
+                out.GetAtomWithIdx(match[refIdx]).SetFormalCharge(
+                    refK.GetAtomWithIdx(refIdx).GetFormalCharge())
+            outMol = out.GetMol()
+            outConf = Chem.Conformer(len(heavyAtoms))
+            for i, p in enumerate(coords):
+                outConf.SetAtomPosition(i, p)
+            outMol.AddConformer(outConf, assignId=True)
+            try:
+                Chem.SanitizeMol(outMol)
             except (ValueError, RuntimeError) as e:
                 lastError = e
                 continue
 
-            # DetermineConnectivity leaves atoms flagged as having no implicit Hs and
-            # may place radical electrons; clear both so AddHs fills open valences.
-            mol = Chem.RWMol(mol)
-            for a in mol.GetAtoms():
-                a.SetNoImplicit(False)
-                a.SetNumRadicalElectrons(0)
-            mol = mol.GetMol()
-            Chem.SanitizeMol(mol)
-
-            molH = Chem.AddHs(mol, addCoords=True)
+            molH = Chem.AddHs(outMol, addCoords=True)
             bonds = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in molH.GetBonds()]
             return molH, bonds
         raise ValueError(f"could not match template to geometry: {lastError}")
