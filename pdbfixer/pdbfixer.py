@@ -87,19 +87,21 @@ dnaResidues = ['DA', 'DG', 'DC', 'DT', 'DI']
 # Terminal capping groups that are part of a protein chain and should be hydrogenated
 # along with the standard amino acids (but, unlike ligands, are not arbitrary heterogens).
 proteinCaps = ['ACE', 'NME', 'NH2', 'NMA', 'FOR']
+# Water residue names (crystallographic water is typically a lone oxygen).
+waterResidues = ['HOH', 'WAT', 'DOD']
 # Residues to hydrogenate in addMissingHydrogens: standard amino acids plus chain caps.
 # Deliberately excludes ligands/heterogens so they are left untouched.
 hydrogenatedProteinResidues = set(proteinResidues) | set(proteinCaps)
-# Standard polymer residues that addMissingHydrogens handles via OpenMM's Modeller:
-# proteins/caps plus standard nucleic acids.  Ligands/heterogens are still excluded
-# (they go through addHydrogensToLigands instead).
+# Standard residues that addMissingHydrogens handles via OpenMM's Modeller: proteins/caps,
+# standard nucleic acids, and water (any water still present is protonated to H-O-H).
+# Ligands/heterogens are still excluded (they go through addHydrogensToLigands instead).
 hydrogenatedStandardResidues = (hydrogenatedProteinResidues |
-                                set(dnaResidues) | set(rnaResidues))
+                                set(dnaResidues) | set(rnaResidues) | set(waterResidues))
 
 # Standard polymer residues and solvent that addHydrogensToLigands must never touch
 # (proteins/caps are handled by addMissingHydrogens; nucleic acids and water too).
 _standardResidues = (set(proteinResidues) | set(proteinCaps) |
-                     set(dnaResidues) | set(rnaResidues) | {'HOH', 'WAT', 'DOD'})
+                     set(dnaResidues) | set(rnaResidues) | set(waterResidues))
 
 class Sequence(object):
     """Sequence holds the sequence of a chain, as specified by SEQRES records."""
@@ -2034,19 +2036,24 @@ class PDBFixer(object):
 
 
 
-    def atomicOPT(self, residueList=None):
-        """Optimize the geometry by energy-minimizing the protein with an AMBER force field.
+    def atomicOPT(self, residueList=None, optimizeWater=True):
+        """Optimize the geometry by energy-minimizing the structure with an AMBER force field.
 
         Parameters
         ----------
         residueList : list, optional, default=None
             Currently unused; reserved for restricting the optimization to a subset of residues.
+        optimizeWater : bool, optional, default=True
+            If True, water molecules are included in the minimization, so their hydrogens
+            are relaxed to the force field's equilibrium geometry and reoriented to hydrogen
+            bond with the solute.  If False, water is carried over unchanged.  Including many
+            crystallographic waters makes the (cutoff-free) minimization noticeably slower.
 
         Notes
         -----
-            Only standard polymer residues (proteins and nucleic acids) are minimized;
-            other components (water, ligands, ...) are carried over unchanged.  Recently
-            added residues may not be well optimized.
+            Standard polymer residues (proteins and nucleic acids), and optionally water,
+            are minimized; other components (ligands, ...) are carried over unchanged.
+            Recently added residues may not be well optimized.
         """
         import tempfile
         from openmm.app import ForceField
@@ -2055,8 +2062,11 @@ class PDBFixer(object):
         from openmm import LangevinMiddleIntegrator
         from openmm.app.pdbfile import PDBFile
 
-        # Residues handled by the AMBER force field: proteins plus standard nucleic acids.
+        # Residues handled by the AMBER force field: proteins plus standard nucleic acids,
+        # and (optionally) water, whose hydrogens are then relaxed too.
         minimizedResidues = set(proteinResidues) | set(dnaResidues) | set(rnaResidues)
+        if optimizeWater:
+            minimizedResidues |= set(waterResidues)
 
         # Identify the polymer atoms to minimize.
         protein_atoms = [atom.index for atom in self.topology.atoms()
