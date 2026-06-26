@@ -1688,12 +1688,13 @@ class PDBFixer(object):
             raise ValueError("could not parse template")
         # Kekulized copy: explicit single/double bonds and no aromatic flags, so we can
         # read concrete bond orders and build a bond-order-agnostic matching query.
-        refK = Chem.Mol(reference)
+        # RemoveHs must come before Kekulize: RemoveHs re-sanitizes (restoring aromatic
+        # bonds), so kekulizing before RemoveHs produces S/D bonds that get overwritten.
+        refK = Chem.RemoveHs(Chem.Mol(reference))
         try:
             Chem.Kekulize(refK, clearAromaticFlags=True)
         except Exception as e:
             raise ValueError(f"could not kekulize template: {e}")
-        refK = Chem.RemoveHs(refK)
         nRefHeavy = refK.GetNumAtoms()
         if nRefHeavy != len(heavyAtoms):
             raise ValueError(
