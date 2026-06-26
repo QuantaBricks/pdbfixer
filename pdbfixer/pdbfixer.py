@@ -367,6 +367,7 @@ class PDBFixer(object):
 
         self.platform = platform
         self.source = None
+        self.input_format = 'pdb'
         if pdbid:
             # A PDB id has been specified.
             url = 'http://www.rcsb.org/pdb/files/%s.pdb' % pdbid
@@ -375,6 +376,7 @@ class PDBFixer(object):
             self.source = filename
             file = open(filename, 'r')
             if _guessFileFormat(file, filename) == 'pdbx':
+                self.input_format = 'pdbx'
                 self._initializeFromPDBx(file)
             else:
                 self._initializeFromPDB(file)
@@ -384,6 +386,7 @@ class PDBFixer(object):
             self._initializeFromPDB(pdbfile)
         elif pdbxfile:
             # A file-like object has been specified.
+            self.input_format = 'pdbx'
             self._initializeFromPDBx(pdbxfile)
         elif url:
             # A URL has been specified.
@@ -393,6 +396,7 @@ class PDBFixer(object):
             file.close()
             file = StringIO(contents)
             if _guessFileFormat(file, url) == 'pdbx':
+                self.input_format = 'pdbx'
                 self._initializeFromPDBx(StringIO(contents))
             else:
                 self._initializeFromPDB(StringIO(contents))
@@ -415,6 +419,13 @@ class PDBFixer(object):
             name = next(templatePdb.topology.residues()).name
             self.templates[name] = Template(templatePdb.topology, templatePdb.positions)
             self._standardTemplates.add(name)
+
+    def writeOutput(self, file):
+        """Write the fixed structure in the same format as the input (PDB or mmCIF)."""
+        if self.input_format == 'pdbx':
+            app.PDBxFile.writeFile(self.topology, self.positions, file, True)
+        else:
+            app.PDBFile.writeFile(self.topology, self.positions, file, True)
 
     def _initializeFromPDB(self, file):
         """Initialize this object by reading a PDB file."""
