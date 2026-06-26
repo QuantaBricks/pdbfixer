@@ -216,8 +216,6 @@ def _guessFileFormat(file, filename):
     filename = filename.lower()
     if '.pdbx' in filename or '.cif' in filename:
         return 'pdbx'
-    if '.pdb' in filename:
-        return 'pdb'
     for line in file:
         if line.startswith('data_') or line.startswith('loop_'):
             file.seek(0)
