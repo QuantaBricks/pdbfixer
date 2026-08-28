@@ -307,6 +307,45 @@ def _findUnoccupiedDirection(point, positions):
     direction /= unit.norm(direction)
     return direction
 
+# Longest plausible covalent bond (nm) between backbone atoms of two consecutive
+# polymer residues.  Topology.createStandardBonds() links residues that are
+# adjacent in a chain without checking distance, so a missing TER record, an
+# out-of-order residue, or an unfilled chain gap yields a multi-angstrom "bond"
+# that breaks force-field template matching.
+_MAX_INTER_RESIDUE_BOND = 0.25
+
+
+def _residueAtomsByName(residue):
+    """Map atom name -> Atom for one residue (first occurrence wins)."""
+    atoms = {}
+    for atom in residue.atoms():
+        atoms.setdefault(atom.name, atom)
+    return atoms
+
+
+def _pruneLongInterResidueBonds(topology, positions, maxLength=_MAX_INTER_RESIDUE_BOND):
+    """Delete bonds between atoms in different residues that are longer than
+    ``maxLength`` (nm).  Such bonds are always artifacts of
+    ``Topology.createStandardBonds`` and give a residue a spurious extra
+    external connection.  Returns the number of bonds removed."""
+    try:
+        maxLength = maxLength.value_in_unit(unit.nanometer)
+    except AttributeError:
+        pass
+    pos = np.array(positions.value_in_unit(unit.nanometer))
+    kept = []
+    removed = 0
+    for bond in topology.bonds():
+        a1, a2 = bond[0], bond[1]
+        if a1.residue.index != a2.residue.index and \
+                np.linalg.norm(pos[a1.index] - pos[a2.index]) > maxLength:
+            removed += 1
+            continue
+        kept.append(bond)
+    if removed:
+        topology._bonds = kept
+    return removed
+
 class PDBFixer(object):
     """PDBFixer implements many tools for fixing problems in PDB and PDBx/mmCIF files.
     """
@@ -420,6 +459,10 @@ class PDBFixer(object):
             self.templates[name] = Template(templatePdb.topology, templatePdb.positions)
             self._standardTemplates.add(name)
 
+        # Fix residues written out of sequence order and remove spurious
+        # inter-residue bonds created from the residue ordering.
+        self._normalizeChainConnectivity()
+
     def writeOutput(self, file):
         """Write the fixed structure in the same format as the input (PDB or mmCIF)."""
         if self.input_format == 'pdbx':
@@ -492,6 +535,175 @@ class PDBFixer(object):
             if -1 not in (asymIdCol, resNameCol, resNumCol, standardResCol):
                 for row in modData.getRowList():
                     self.modifiedResidues.append(ModifiedResidue(row[asymIdCol], int(row[resNumCol]), row[resNameCol], row[standardResCol]))
+
+
+    def _normalizeChainConnectivity(self):
+        """Reorder residues within each chain so their order matches the covalent
+        connectivity implied by the coordinates.
+
+        Some PDB files list a residue out of sequence order -- a common example
+        is an N-terminal cloning/expression tag or a chain-terminal cap that is
+        written *after* the C-terminal residue and given an out-of-range residue
+        number.  Because OpenMM builds inter-residue bonds from the order of
+        residues in a chain, a misplaced residue gets bonded to the wrong
+        neighbour (typically several angstroms away).  That spurious bond breaks
+        force-field template matching in :meth:`atomicOPT` and confuses
+        terminal-atom detection in :meth:`findMissingAtoms` (e.g. a stray OXT).
+
+        This routine infers the real backbone links from interatomic distances
+        (peptide ``C(i)-N(i+1)`` and phosphodiester ``O3'(i)-P(i+1)``), walks
+        each connected segment back into sequence order, rebuilds the topology in
+        that order, and drops any remaining physically impossible inter-residue
+        bonds.  Plain gaps from missing residues (no bond, but consistent
+        numbering) are left untouched.
+        """
+        residues = list(self.topology.residues())
+        if len(residues) < 3:
+            _pruneLongInterResidueBonds(self.topology, self.positions)
+            return
+        resPos = np.array(self.positions.value_in_unit(unit.nanometer))
+        resIndex = {res: i for i, res in enumerate(residues)}
+
+        # Collect backbone anchor atoms for residues that look like polymer units.
+        donorC = {}      # residue -> index of backbone C   (peptide donor)
+        acceptorN = {}   # residue -> index of backbone N   (peptide acceptor)
+        donorO3 = {}     # residue -> index of O3'          (nucleic donor)
+        acceptorP = {}   # residue -> index of P            (nucleic acceptor)
+        for res in residues:
+            names = _residueAtomsByName(res)
+            if {'N', 'C', 'CA'}.issubset(names):
+                donorC[res] = names['C'].index
+                acceptorN[res] = names['N'].index
+            if "O3'" in names and "C3'" in names:
+                donorO3[res] = names["O3'"].index
+            if 'P' in names and "C3'" in names:
+                acceptorP[res] = names['P'].index
+
+        nextOf = {}   # residue -> (nextResidue, distance)
+        prevOf = {}   # residue -> (prevResidue, distance)
+
+        def _linkClosest(donors, acceptorByRes, cutoff):
+            acceptors = list(acceptorByRes)
+            if not donors or not acceptors:
+                return
+            accArr = resPos[[acceptorByRes[r] for r in acceptors]]
+            for res, di in donors.items():
+                d = np.linalg.norm(accArr - resPos[di], axis=1)
+                for j in np.argsort(d):
+                    if d[j] > cutoff:
+                        break
+                    cand = acceptors[j]
+                    if cand is res:
+                        continue
+                    dist = float(d[j])
+                    if nextOf.get(res, (None, 1e9))[1] <= dist:
+                        break
+                    if prevOf.get(cand, (None, 1e9))[1] <= dist:
+                        continue
+                    if res in nextOf:
+                        prevOf.pop(nextOf[res][0], None)
+                    if cand in prevOf:
+                        nextOf.pop(prevOf[cand][0], None)
+                    nextOf[res] = (cand, dist)
+                    prevOf[cand] = (res, dist)
+                    break
+
+        _linkClosest(donorC, acceptorN, 0.20)
+        _linkClosest(donorO3, acceptorP, 0.22)
+        nextOf = {k: v[0] for k, v in nextOf.items()}
+        prevOf = {k: v[0] for k, v in prevOf.items()}
+
+        # Group residues into connected segments (union-find over the links).
+        parent = list(range(len(residues)))
+
+        def _find(x):
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        for a, b in nextOf.items():
+            ra, rb = _find(resIndex[a]), _find(resIndex[b])
+            if ra != rb:
+                parent[rb] = ra
+
+        segMembers = defaultdict(list)
+        for res in residues:
+            segMembers[_find(resIndex[res])].append(res)
+
+        # Order each segment as a backbone walk; leave branched/odd ones as-is.
+        orderedSeg = {}
+        for root, members in segMembers.items():
+            if len(members) == 1:
+                orderedSeg[root] = members
+                continue
+            memberSet = set(members)
+            starts = sorted((r for r in members if prevOf.get(r) not in memberSet),
+                            key=lambda r: resIndex[r])
+            if not starts:
+                starts = [min(members, key=lambda r: resIndex[r])]
+            walk, seen = [], set()
+            cur = starts[0]
+            while cur is not None and cur not in seen:
+                walk.append(cur)
+                seen.add(cur)
+                cur = nextOf.get(cur)
+            if len(walk) != len(members):
+                walk = sorted(members, key=lambda r: resIndex[r])
+            orderedSeg[root] = walk
+
+        # Build the new global residue order: emit each segment (in walk order)
+        # at the position of its first residue in the original order.
+        newOrder, emitted = [], set()
+        for res in residues:
+            root = _find(resIndex[res])
+            if root in emitted:
+                continue
+            emitted.add(root)
+            newOrder.extend(orderedSeg[root])
+
+        if newOrder == residues:
+            _pruneLongInterResidueBonds(self.topology, self.positions)
+            return
+
+        # A segment that spans several chains is covalently one chain: give all
+        # its residues the chain of its (new) first residue.
+        homeChain = {}
+        for seg in orderedSeg.values():
+            for r in seg:
+                homeChain[r] = seg[0].chain
+
+        newTopology = app.Topology()
+        newTopology.setUnitCellDimensions(self.topology.getUnitCellDimensions())
+        atomMap = {}
+        newPositions = [] * unit.nanometer
+        chainMap = {}
+        for res in newOrder:
+            srcChain = homeChain.get(res, res.chain)
+            if srcChain not in chainMap:
+                chainMap[srcChain] = newTopology.addChain(srcChain.id)
+            newRes = newTopology.addResidue(res.name, chainMap[srcChain], res.id, res.insertionCode)
+            for atom in res.atoms():
+                atomMap[atom] = newTopology.addAtom(atom.name, atom.element, newRes, atom.id)
+                newPositions.append(self.positions[atom.index])
+
+        newTopology.createStandardBonds()
+        newTopology.createDisulfideBonds(newPositions)
+        for a1, a2 in self.topology.bonds():
+            if a1 in atomMap and a2 in atomMap and (
+                    a1.residue.name not in app.Topology._standardBonds
+                    or a2.residue.name not in app.Topology._standardBonds):
+                newTopology.addBond(atomMap[a1], atomMap[a2])
+        _pruneLongInterResidueBonds(newTopology, newPositions)
+
+        print("PDBFixer: reordered residues in chain(s) %s to match covalent "
+              "connectivity" % ", ".join(sorted({c.id for c in chainMap.values()})),
+              file=sys.stderr)
+
+        self.topology = newTopology
+        self.positions = newPositions
 
 
     def _downloadCCDDefinition(self, residueName: str) -> Optional[CCDResidueDefinition]:
@@ -2151,8 +2363,18 @@ class PDBFixer(object):
         finally:
             os.remove(tmpName)
 
+        # PDBFile rebuilds bonds from residue order, so an unfilled chain gap or
+        # a chain break with no TER can reintroduce an impossibly long backbone
+        # "bond" that fails template matching.  Drop those before building the system.
+        _pruneLongInterResidueBonds(pdb.topology, pdb.positions)
+
         forcefield = ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
-        system = forcefield.createSystem(pdb.topology, nonbondedMethod=NoCutoff, nonbondedCutoff=1*unit.nanometer, constraints=HBonds)
+        # ignoreExternalBonds lets residues at a genuine, unfilled chain break
+        # (e.g. an unresolved loop in a file with no SEQRES to rebuild it from)
+        # match their standard template instead of raising.  Safe here because the
+        # impossible long bonds have already been pruned above.
+        system = forcefield.createSystem(pdb.topology, nonbondedMethod=NoCutoff, nonbondedCutoff=1*unit.nanometer,
+                                         constraints=HBonds, ignoreExternalBonds=True)
         integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.004*unit.picoseconds)
         simulation = Simulation(pdb.topology, system, integrator)
         simulation.context.setPositions(pdb.positions)
