@@ -2368,13 +2368,32 @@ class PDBFixer(object):
         # "bond" that fails template matching.  Drop those before building the system.
         _pruneLongInterResidueBonds(pdb.topology, pdb.positions)
 
+        # ignoreExternalBonds tolerates a genuine, unfilled chain break (e.g. an
+        # unresolved loop with no SEQRES to rebuild it from), but by itself it
+        # also erases the external-bond check that tells a disulfide-bonded CYS
+        # (template CYX) apart from a free thiolate (template CYM), so any
+        # structure with a real disulfide would fail with "Multiple
+        # non-identical matching templates ... CYM, CYX."  Resolve those CYS
+        # residues ourselves from the actual SG bonding (which we trust more
+        # than the flag-relaxed auto-match anyway) so they never hit that
+        # ambiguous path.
+        cysTemplates = {}
+        for residue in pdb.topology.residues():
+            if residue.name != 'CYS':
+                continue
+            atomsByName = _residueAtomsByName(residue)
+            if 'HG' in atomsByName:
+                cysTemplates[residue] = 'CYS'
+            else:
+                sg = atomsByName.get('SG')
+                hasDisulfide = sg is not None and any(
+                    sg in bond and bond[0].residue is not bond[1].residue
+                    for bond in pdb.topology.bonds())
+                cysTemplates[residue] = 'CYX' if hasDisulfide else 'CYM'
+
         forcefield = ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
-        # ignoreExternalBonds lets residues at a genuine, unfilled chain break
-        # (e.g. an unresolved loop in a file with no SEQRES to rebuild it from)
-        # match their standard template instead of raising.  Safe here because the
-        # impossible long bonds have already been pruned above.
         system = forcefield.createSystem(pdb.topology, nonbondedMethod=NoCutoff, nonbondedCutoff=1*unit.nanometer,
-                                         constraints=HBonds, ignoreExternalBonds=True)
+                                         constraints=HBonds, ignoreExternalBonds=True, residueTemplates=cysTemplates)
         integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.004*unit.picoseconds)
         simulation = Simulation(pdb.topology, system, integrator)
         simulation.context.setPositions(pdb.positions)
