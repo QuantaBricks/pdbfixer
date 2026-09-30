@@ -89,6 +89,10 @@ dnaResidues = ['DA', 'DG', 'DC', 'DT', 'DI']
 proteinCaps = ['ACE', 'NME', 'NH2', 'NMA', 'FOR']
 # Water residue names (crystallographic water is typically a lone oxygen).
 waterResidues = ['HOH', 'WAT', 'DOD']
+# Elements that are not metals; a single-atom heterogen of any other element (Zn, Mg, Fe, ...)
+# is treated as a metal ion by removeHeterogens(keepIons=True).
+_nonMetalSymbols = frozenset(['H', 'D', 'He', 'B', 'C', 'N', 'O', 'F', 'Ne', 'Si', 'P', 'S', 'Cl', 'Ar',
+                              'As', 'Se', 'Br', 'Kr', 'Te', 'I', 'Xe', 'At', 'Rn'])
 # Residues to hydrogenate in addMissingHydrogens: standard amino acids plus chain caps.
 # Deliberately excludes ligands/heterogens so they are left untouched.
 hydrogenatedProteinResidues = set(proteinResidues) | set(proteinCaps)
@@ -1663,7 +1667,7 @@ class PDBFixer(object):
         localExisting = {k: atomMap[v] for k, v in existingAtomMap.items() if v in atomMap}
         return localTopology, localPositions, localNew, localExisting, fullToLocal
 
-    def removeHeterogens(self, keepWater=True, keepCoenzyme=False):
+    def removeHeterogens(self, keepWater=True, keepCoenzyme=False, keepIons=True):
         """Remove heterogens (non-polymer residues) from the structure.
 
         Parameters
@@ -1672,6 +1676,10 @@ class PDBFixer(object):
             If True, water molecules will not be removed.
         keepCoenzyme : bool, optional, default=False
             If True, coenzymes/ligands (heterogens other than water) will not be removed.
+        keepIons : bool, optional, default=True
+            If True, single-atom metal ions (Zn2+, Mg2+, Fe, ...) will not be removed, even when
+            keepCoenzyme is False.  Polyatomic metal sites (heme, Fe-S clusters) are ligands and
+            are governed by keepCoenzyme.
 
         Returns
         -------
@@ -1702,8 +1710,8 @@ class PDBFixer(object):
                 if not keepWater:
                     toDelete.append(residue)
             elif residue.name not in keep:
-                # Any other heterogen is governed by keepCoenzyme.
-                if not keepCoenzyme:
+                # Any other heterogen is governed by keepCoenzyme (metal ions also by keepIons).
+                if not keepCoenzyme and not (keepIons and self._isMetalIon(residue)):
                     toDelete.append(residue)
 
         if toDelete:
@@ -1712,6 +1720,15 @@ class PDBFixer(object):
             self.topology = modeller.topology
             self.positions = modeller.positions
         return toDelete
+
+    @staticmethod
+    def _isMetalIon(residue):
+        """True if the residue is a single metal atom."""
+        atoms = list(residue.atoms())
+        if len(atoms) != 1:
+            return False
+        element = atoms[0].element
+        return element is not None and element.symbol not in _nonMetalSymbols
 
     def addMissingHydrogens(self, pH=7.0, forcefield=None):
         """Add missing hydrogen atoms to the structure.
@@ -2556,6 +2573,7 @@ def main():
         parser.add_option('--output', default='output.pdb', dest='output', metavar='FILENAME', help='output pdb file [default: output.pdb]')
         parser.add_option('--add-atoms', default='all', dest='atoms', choices=('all', 'heavy', 'hydrogen', 'none'), help='which missing atoms to add: all, heavy, hydrogen, or none [default: all]')
         parser.add_option('--keep-heterogens', default='all', dest='heterogens', choices=('all', 'water', 'none'), metavar='OPTION', help='which heterogens to keep: all, water, or none [default: all]')
+        parser.add_option('--remove-ions', action='store_false', default=True, dest='keepIons', help='also remove single-atom metal ions (Zn, Mg, Fe, ...) when removing heterogens [default: ions are kept]')
         parser.add_option('--replace-nonstandard', action='store_true', default=False, dest='nonstandard', help='replace nonstandard residues with standard equivalents')
         parser.add_option('--add-residues', action='store_true', default=False, dest='residues', help='add missing residues')
         parser.add_option('--water-box', dest='box', type='float', nargs=3, metavar='X Y Z', help='add a water box. The value is the box dimensions in nm [example: --water-box=2.5 2.4 3.0]')
@@ -2588,9 +2606,9 @@ def main():
             if options.verbose: print('Replacing nonstandard residues...')
             fixer.replaceNonstandardResidues()
         if options.heterogens == 'none':
-            fixer.removeHeterogens(False)
+            fixer.removeHeterogens(False, keepIons=options.keepIons)
         elif options.heterogens == 'water':
-            fixer.removeHeterogens(True)
+            fixer.removeHeterogens(True, keepIons=options.keepIons)
         if options.verbose: print('Finding missing atoms...')
         fixer.findMissingAtoms()
         if options.atoms not in ('all', 'heavy'):
