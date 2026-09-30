@@ -314,6 +314,20 @@ def _findUnoccupiedDirection(point, positions):
 # that breaks force-field template matching.
 _MAX_INTER_RESIDUE_BOND = 0.25
 
+# Parameters of the energy minimization that positions atoms added by addMissingAtoms().  Distances are in nm.
+#
+# Only residues within _MINIMIZATION_RADIUS of a new atom are included, so the cost scales with the number of new
+# atoms rather than the size of the structure.  The soft repulsion is negligible beyond _REPULSION_CUTOFF.
+# _REPULSION_STRENGTH is much larger than one because, at 1, the force between two overlapping atoms (at most
+# ~5 kJ/mol/nm) is weaker than the bonded terms within a residue and overlaps are not resolved.  Most of the energy
+# drop happens in the first _MINIMIZER_MAX_ITERATIONS iterations; if atoms are still too close afterwards the
+# minimization is continued to convergence.
+_MINIMIZATION_RADIUS = 1.0
+_REPULSION_CUTOFF = 1.0
+_REPULSION_STRENGTH = 30.0
+_MINIMIZER_TOLERANCE = 0.1
+_MINIMIZER_MAX_ITERATIONS = 100
+
 
 def _residueAtomsByName(residue):
     """Map atom name -> Atom for one residue (first occurrence wins)."""
@@ -1494,6 +1508,12 @@ class PDBFixer(object):
                 self.topology.addBond(inverseAtomMap[atom1], inverseAtomMap[atom2])
         else:
 
+            # Only minimize the residues near the new atoms; the rest of the structure is left out of the System.
+
+            fullNewAtoms = newAtoms
+            (newTopology, newPositions, newAtoms, existingAtomMap, fullToLocal) = self._extractLocalRegion(
+                newTopology, newPositions, newAtoms, existingAtomMap, _MINIMIZATION_RADIUS)
+
             # Create a System for energy minimizing it.
 
             forcefield = self._createForceField(newTopology, False)
@@ -1507,11 +1527,20 @@ class PDBFixer(object):
             # If any heavy atoms were omitted, add them back to avoid steric clashes.
 
             nonbonded = [f for f in system.getForces() if isinstance(f, mm.CustomNonbondedForce)][0]
+            newAtomPositions = np.array([newPositions[atom.index].value_in_unit(unit.nanometer) for atom in newAtoms])
             for atom in self.topology.atoms():
                 if atom.element not in (None, hydrogen) and atom not in existingAtomMap:
+                    pos = np.array(self.positions[atom.index].value_in_unit(unit.nanometer))
+                    if np.min(np.sum((newAtomPositions-pos)**2, axis=1)) > _MINIMIZATION_RADIUS**2:
+                        continue
                     system.addParticle(0.0)
                     nonbonded.addParticle([])
                     newPositions.append(self.positions[atom.index])
+
+            # The soft repulsion is negligible at long range; a cutoff avoids the all-pairs cost on large systems.
+
+            nonbonded.setNonbondedMethod(mm.CustomNonbondedForce.CutoffNonPeriodic)
+            nonbonded.setCutoffDistance(_REPULSION_CUTOFF*unit.nanometer)
 
             # For efficiency, only compute interactions that involve a new atom.
 
@@ -1526,8 +1555,9 @@ class PDBFixer(object):
                 context = mm.Context(system, integrator)
             else:
                 context = mm.Context(system, integrator, self.platform)
+            context.setParameter('C', _REPULSION_STRENGTH)
             context.setPositions(newPositions)
-            mm.LocalEnergyMinimizer.minimize(context)
+            mm.LocalEnergyMinimizer.minimize(context, tolerance=_MINIMIZER_TOLERANCE, maxIterations=_MINIMIZER_MAX_ITERATIONS)
             state = context.getState(getPositions=True)
             if newTopology.getNumResidues() > 1:
                 # When looking for pairs of atoms that are too close to each other, exclude pairs that
@@ -1542,22 +1572,36 @@ class PDBFixer(object):
                 cutoff = 0.13
                 nearest = self._findNearestDistance(context, newAtoms, cutoff, exclusions)
                 if nearest < cutoff:
+                    # The capped minimization may simply not have converged yet.
+                    mm.LocalEnergyMinimizer.minimize(context, tolerance=_MINIMIZER_TOLERANCE)
+                    state = context.getState(getPositions=True)
+                    nearest = self._findNearestDistance(context, newAtoms, cutoff, exclusions)
+                if nearest < cutoff:
 
                     # Some atoms are very close together.  Run some dynamics while slowly increasing the strength of the
                     # repulsive interaction to try to improve the result.
 
+                    # Give up after several rounds in a row without improvement: a clash that dynamics cannot
+                    # resolve (e.g. one already present in the input model) would otherwise cost all 10 rounds.
+
+                    roundsWithoutImprovement = 0
                     for i in range(10):
-                        context.setParameter('C', 0.15*(i+1))
+                        context.setParameter('C', 0.15*(i+1)*_REPULSION_STRENGTH)
                         integrator.step(200)
                         d = self._findNearestDistance(context, newAtoms, cutoff, exclusions)
                         if d > nearest:
                             nearest = d
                             state = context.getState(getPositions=True)
+                            roundsWithoutImprovement = 0
                             if nearest >= cutoff:
                                 break
+                        else:
+                            roundsWithoutImprovement += 1
+                            if roundsWithoutImprovement >= 3:
+                                break
                     context.setState(state)
-                    context.setParameter('C', 1.0)
-                    mm.LocalEnergyMinimizer.minimize(context)
+                    context.setParameter('C', _REPULSION_STRENGTH)
+                    mm.LocalEnergyMinimizer.minimize(context, tolerance=_MINIMIZER_TOLERANCE)
                     state = context.getState(getPositions=True)
 
             # Now create a new Topology, including all atoms from the original one and adding the missing atoms.
@@ -1566,10 +1610,58 @@ class PDBFixer(object):
 
             # Copy over the minimized positions for the new atoms.
 
-            for a1, a2 in zip(newAtoms, newAtoms2):
-                newPositions2[a2.index] = state.getPositions()[a1.index]
+            minimized = state.getPositions()
+            for a1, a2 in zip(fullNewAtoms, newAtoms2):
+                newPositions2[a2.index] = minimized[fullToLocal[a1.index]]
             self.topology = newTopology2
             self.positions = newPositions2
+
+    def _extractLocalRegion(self, topology, positions, newAtoms, existingAtomMap, radius):
+        """Build a Topology containing only the residues within ``radius`` (nm) of a new atom.
+
+        Returns (topology, positions, newAtoms, existingAtomMap, fullToLocal) where fullToLocal maps atom
+        indices in the input Topology to indices in the returned one (atoms outside the region are absent).
+        """
+        pos = np.array([p.value_in_unit(unit.nanometer) if unit.is_quantity(p) else p for p in positions],
+                       dtype=float)
+        newIndices = [a.index for a in newAtoms]
+        boxSize = np.max(pos, axis=0)-np.min(pos, axis=0)+2*radius
+        cells = app.modeller._CellList(pos, radius, [(boxSize[0], 0, 0), (0, boxSize[1], 0), (0, 0, boxSize[2])],
+                                       False)
+        near = set(newIndices)
+        r2 = radius*radius
+        for i in newIndices:
+            for j in cells.neighbors(pos[i]):
+                if j not in near:
+                    d = pos[j]-pos[i]
+                    if np.dot(d, d) <= r2:
+                        near.add(j)
+        keepResidues = {atom.residue for atom in topology.atoms() if atom.index in near}
+        newIndexSet = set(newIndices)
+        localTopology = app.Topology()
+        localTopology.setPeriodicBoxVectors(topology.getPeriodicBoxVectors())
+        localPositions = []
+        fullToLocal = {}
+        atomMap = {}
+        for chain in topology.chains():
+            localChain = None
+            for residue in chain.residues():
+                if residue not in keepResidues:
+                    continue
+                if localChain is None:
+                    localChain = localTopology.addChain(chain.id)
+                localResidue = localTopology.addResidue(residue.name, localChain, residue.id, residue.insertionCode)
+                for atom in residue.atoms():
+                    localAtom = localTopology.addAtom(atom.name, atom.element, localResidue)
+                    atomMap[atom] = localAtom
+                    fullToLocal[atom.index] = localAtom.index
+                    localPositions.append(positions[atom.index])
+        for atom1, atom2 in topology.bonds():
+            if atom1 in atomMap and atom2 in atomMap:
+                localTopology.addBond(atomMap[atom1], atomMap[atom2])
+        localNew = [atomMap[a] for a in newAtoms]
+        localExisting = {k: atomMap[v] for k, v in existingAtomMap.items() if v in atomMap}
+        return localTopology, localPositions, localNew, localExisting, fullToLocal
 
     def removeHeterogens(self, keepWater=True, keepCoenzyme=False):
         """Remove heterogens (non-polymer residues) from the structure.
@@ -1659,7 +1751,8 @@ class PDBFixer(object):
         modeller = app.Modeller(self.topology, self.positions)
         if len(protein_atoms) < self.topology.getNumAtoms():
             # Only keep protein atoms
-            to_delete = [atom for atom in self.topology.atoms() if atom.index not in protein_atoms]
+            protein_atom_set = set(protein_atoms)
+            to_delete = [atom for atom in self.topology.atoms() if atom.index not in protein_atom_set]
             modeller.delete(to_delete)
         
         # Now add hydrogens only to protein residues
@@ -1684,20 +1777,20 @@ class PDBFixer(object):
                 new_chain = new_topology.addChain(chain.id)
                 chain_map[chain] = new_chain
             
+            # Index the modeller residues once instead of scanning them for every residue.
+            modeller_residues = {}
+            for mr in modeller.topology.residues():
+                modeller_residues.setdefault((mr.name, mr.id, mr.chain.id), mr)
+            modeller_positions = modeller.positions.value_in_unit(unit.nanometer)
+
             # Copy residues and atoms
             atom_map = {}
             for residue in self.topology.residues():
                 new_residue = new_topology.addResidue(residue.name, chain_map[residue.chain], residue.id, residue.insertionCode)
 
                 if residue.name in hydrogenatedStandardResidues:
-                    # Find matching residue in modeller
-                    mod_res = None
-                    for mr in modeller.topology.residues():
-                        if (mr.name == residue.name and 
-                            mr.id == residue.id and 
-                            mr.chain.id == residue.chain.id):
-                            mod_res = mr
-                            break
+                    # Find matching residue in modeller (first match, as a linear search would give)
+                    mod_res = modeller_residues.get((residue.name, residue.id, residue.chain.id))
                     
                     if mod_res is None:
                         raise ValueError(f"Could not find matching residue {residue.name} {residue.id} in modeller")
@@ -1706,7 +1799,7 @@ class PDBFixer(object):
                     for mod_atom in mod_res.atoms():
                         new_atom = new_topology.addAtom(mod_atom.name, mod_atom.element, new_residue)
                         atom_map[mod_atom] = new_atom
-                        new_positions.append(modeller.positions[mod_atom.index])
+                        new_positions.append(modeller_positions[mod_atom.index]*unit.nanometer)
                 
                 # Handle non-protein residues (original atoms)
                 else:
@@ -2350,7 +2443,8 @@ class PDBFixer(object):
         modeller = app.Modeller(self.topology, self.positions)
         proteinOnly = len(protein_atoms) < self.topology.getNumAtoms()
         if proteinOnly:
-            to_delete = [atom for atom in self.topology.atoms() if atom.index not in protein_atoms]
+            protein_atom_set = set(protein_atoms)
+            to_delete = [atom for atom in self.topology.atoms() if atom.index not in protein_atom_set]
             modeller.delete(to_delete)
 
         # Round-trip through a PDB file so the topology matches the force field templates,
