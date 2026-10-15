@@ -89,6 +89,9 @@ dnaResidues = ['DA', 'DG', 'DC', 'DT', 'DI']
 proteinCaps = ['ACE', 'NME', 'NH2', 'NMA', 'FOR']
 # Water residue names (crystallographic water is typically a lone oxygen).
 waterResidues = ['HOH', 'WAT', 'DOD']
+# Maximum N-metal distance (nm) at which a histidine ring nitrogen is considered metal-coordinating.
+_metalHisCutoff = 0.26
+
 # Elements that are not metals; a single-atom heterogen of any other element (Zn, Mg, Fe, ...)
 # is treated as a metal ion by removeHeterogens(keepIons=True).
 _nonMetalSymbols = frozenset(['H', 'D', 'He', 'B', 'C', 'N', 'O', 'F', 'Ne', 'Si', 'P', 'S', 'Cl', 'Ar',
@@ -1773,8 +1776,12 @@ class PDBFixer(object):
             modeller.delete(to_delete)
         
         # Now add hydrogens only to protein residues
+        metalBoundHis = self._findMetalBoundHistidines()
         for res in modeller.topology.residues():
             variant = self._describeVariant(res, extraDefinitions)
+            if variant is None and res.name == 'HIS':
+                # Leave the nitrogen that binds a metal unprotonated (HID/HIE) instead of the pH default.
+                variant = metalBoundHis.get((res.chain.id, res.id, res.insertionCode))
             variants.append(variant)
         
         
@@ -2143,6 +2150,30 @@ class PDBFixer(object):
                 bonds = [(bond.atom1, bond.atom2) for bond in ccdDefinition.bonds]
                 definitions[name] = (atoms, bonds)
         return definitions
+
+    def _findMetalBoundHistidines(self):
+        """Map (chain id, residue id, insertion code) of each histidine whose ring nitrogen coordinates a
+        single-atom metal ion to the protonation variant that keeps that nitrogen free: 'HIE' when ND1
+        binds the metal, 'HID' when NE2 does.  Histidines binding through both nitrogens are omitted.
+        """
+        metals = [self.positions[a.index].value_in_unit(unit.nanometer)
+                  for r in self.topology.residues() if self._isMetalIon(r) for a in r.atoms()]
+        result = {}
+        if not metals:
+            return result
+        metals = np.array([[v.x, v.y, v.z] for v in metals])
+        for residue in self.topology.residues():
+            if residue.name != 'HIS':
+                continue
+            bound = set()
+            for atom in residue.atoms():
+                if atom.name in ('ND1', 'NE2'):
+                    p = self.positions[atom.index].value_in_unit(unit.nanometer)
+                    if np.min(np.linalg.norm(metals - np.array([p.x, p.y, p.z]), axis=1)) < _metalHisCutoff:
+                        bound.add(atom.name)
+            if len(bound) == 1:
+                result[(residue.chain.id, residue.id, residue.insertionCode)] = 'HIE' if 'ND1' in bound else 'HID'
+        return result
 
     def _describeVariant(self, residue, definitions):
         """Build the variant description to pass to addHydrogens() for a residue."""
